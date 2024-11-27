@@ -1,0 +1,30 @@
+
+{
+    "AAE": {
+        "cca2": "DZ",
+        "city": "Annaba",
+        "country": "Algeria",
+        "lat": 36.85596,
+        "lon": 7.79207,
+        "name": "Annaba, Algeria",
+        "region": "Test"
+    },
+    "ABJ": {
+        "cca2": "CI",
+        "city": "Abidjan",
+        "country": "Ivory Coast",
+        "lat": 5.292598,
+        "lon": -3.999133,
+        "name": "Abidjan, Ivory Coast",
+        "region": "Africa"
+    },
+    "ABQ": {
+        "cca2": "US",
+        "city": "Albuquerque",
+        "country": "United States",
+        "lat": 35.0844,
+        "lon": -106.6504,
+        "name": "Albuquerque, United States",
+        "region": "Test"
+    }
+}
