@@ -311,6 +311,7 @@ end
 csv_data = []
 skipped_data = []
 options[:colos].each do |colo|
+  # sleep 20
   colo_info = cf_colos[colo]
   colo_name = colo.downcase
   next unless colo_info
@@ -356,6 +357,8 @@ options[:colos].each do |colo|
     approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
       final_geo[:lat], final_geo[:long]
     ) : 'not_applicable'
+    approx_gcp_city = approx_nearest_gcp == 'not_applicable' ? 'not_applicable'
+      : GCP_REGIONS[approx_nearest_gcp][:city]
 
     json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
     File.write(json_file, JSON.pretty_generate(traceroute))
@@ -374,6 +377,7 @@ options[:colos].each do |colo|
       target_distance_km: orthodromic_distance(
         colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
       ),
+      approx_gcp_city: approx_gcp_city,
       start_subcolo: subcolo,
       target_ip: target[:ip],
       target_domain: target[:domain],
