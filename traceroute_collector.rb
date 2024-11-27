@@ -237,6 +237,63 @@ def map_gcp_region(lat, long)
   closest_region || 'not_applicable'
 end
 
+def packet_loss_pct(sent, lost)
+  return 0 if sent == 0
+  (lost.to_f / sent * 100).round(2)
+end
+
+def collect_hop_data(hops)
+  congested_hops = []
+  slowest_hops = []
+
+  rtt_values = hops.map do |hop|
+    hop.dig('nodes', 0, 'mean_rtt_ms') || 0
+  end
+  mean_rtt = rtt_values.sum / rtt_values.size
+  variance = rtt_values.map { |rtt| (rtt - mean_rtt)**2 }.sum / rtt_values.size
+  std_dev_rtt = Math.sqrt(variance)
+
+  hops.each do |hop|
+    packets_sent = hop['packets_sent'] || 0
+    packets_lost = hop['packets_lost'] || 0
+    packet_loss_percent = packet_loss_pct(packets_sent, packets_lost)
+
+    (hop['nodes'] || []).each do |node|
+      node_ip = node['ip']
+      node_name = node['name']
+      mean_rtt_ms = node['mean_rtt_ms'] || 0
+      std_dev_rtt_ms = node['std_dev_rtt_ms'] || 0
+      min_rtt_ms = node['min_rtt_ms'] || 0
+      max_rtt_ms = node['max_rtt_ms'] || 0
+
+      if packet_loss_percent > 50
+        congested_hops << {
+          ip: node_ip,
+          name: node_name,
+          packet_loss_percent: packet_loss_percent,
+          mean_rtt_ms: mean_rtt_ms.round(2),
+          std_dev_rtt_ms: std_dev_rtt_ms.round(2),
+          min_rtt_ms: min_rtt_ms.round(2),
+          max_rtt_ms: max_rtt_ms.round(2)
+        }
+      end
+
+      if mean_rtt_ms > mean_rtt + std_dev_rtt
+        slowest_hops << {
+          ip: node_ip,
+          name: node_name,
+          mean_rtt_ms: mean_rtt_ms.round(2),
+          std_dev_rtt_ms: std_dev_rtt_ms.round(2),
+          min_rtt_ms: min_rtt_ms.round(2),
+          max_rtt_ms: max_rtt_ms.round(2)
+        }
+      end
+    end
+  end
+
+  [congested_hops, slowest_hops]
+end
+
 def append_to_csv(file, data)
   write_headers = !File.exist?(file)
   CSV.open(file, 'a') do |csv|
@@ -303,6 +360,8 @@ options[:colos].each do |colo|
     json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
     File.write(json_file, JSON.pretty_generate(traceroute))
 
+    congested_hops, slowest_hops = collect_hop_data(hops)
+
     csv_data << {
       start_region: region_short,
       start_colo: colo_name,
@@ -328,7 +387,9 @@ options[:colos].each do |colo|
       colo_country: colo_country_short || colo_info['country'],
       target_lat: final_geo[:lat],
       target_long: final_geo[:long],
-      target_country: final_geo[:country]
+      target_country: final_geo[:country],
+      congested_hops: congested_hops.to_json,
+      slowest_hops: slowest_hops.to_json
     }
   end
 end
