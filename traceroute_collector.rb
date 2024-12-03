@@ -197,7 +197,7 @@ def orthodromic_distance(lat1, lon1, lat2, lon2)
 end
 
 def infer_final_hop_geo(hops, target_ip)
-  hops.reverse_each do |hop|
+  hops&.reverse_each do |hop|
     hop['nodes']&.reverse_each do |node|
       next unless node['ip']
 
@@ -243,6 +243,7 @@ def packet_loss_pct(sent, lost)
 end
 
 def collect_hop_data(hops)
+  return [[], []] if hops.nil? || hops.empty?
   congested_hops = []
   slowest_hops = []
 
@@ -302,6 +303,27 @@ def append_to_csv(file, data)
   end
 end
 
+def log_skipped_traceroute(
+  skipped_data:,
+  region_short:,
+  colo_name:,
+  target:,
+  skip_reason:,
+  error_details:
+)
+  puts "Skipping colo=#{colo_name} due to #{skip_reason}"
+  skipped_data << {
+    start_region: region_short,
+    start_colo: colo_name,
+    trace_target: target[:name],
+    target_ip: target[:ip],
+    target_domain: target[:domain],
+    skipped_reason: skip_reason,
+    error_details: error_details
+  }
+  sleep 2
+end
+
 Dir.mkdir(options[:output_dir]) unless Dir.exist?(options[:output_dir])
 cf_colos = load_colo_data(options[:cf_colo_file])
 if options[:region]
@@ -311,8 +333,8 @@ end
 csv_data = []
 skipped_data = []
 options[:colos].each do |colo|
-  # sleep 20
-  colo_info = cf_colos[colo]
+  sleep 2
+  colo_info = cf_colos[colo.upcase]
   colo_name = colo.downcase
   next unless colo_info
 
@@ -321,6 +343,9 @@ options[:colos].each do |colo|
   FileUtils.mkdir_p(region_dir)
 
   options[:targets].each do |target|
+    skip_reason = nil
+    error_details = "not_applicable"
+
     uri = "#{options[:traceroute_uri]}?colos=#{colo_name}&targets=#{target[:ip]}"
     puts "Fetching #{colo_name} traceroute to #{target[:ip]} ..."
     puts "URI: #{uri}"
@@ -328,23 +353,39 @@ options[:colos].each do |colo|
 
     no_response = response.nil? || response.empty?
     traceroute = JSON.parse(response) unless no_response rescue nil
-    if no_response || traceroute.nil? || traceroute['result'].nil?
-      puts "Skipping colo=#{colo_name} due to no traceroute response"
-      skipped_data << {
-        start_region: region_short,
-        start_colo: colo_name,
-        trace_target: target[:name],
-        target_ip: target[:ip],
-        target_domain: target[:domain],
-        skipped_reason: 'no_traceroute_response'
-      }
-      sleep 2
+    no_traceroute = traceroute.nil? || (not traceroute.is_a?(Hash))
+    if no_response || no_traceroute || traceroute['result'].nil?
+      log_skipped_traceroute(
+        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
+        skip_reason: 'no_traceroute_response',
+        error_details: 'not_applicable'
+      )
+      next
+    end
+
+    failed_execution = (not traceroute['success'])
+    if failed_execution
+      log_skipped_traceroute(
+        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
+        skip_reason: 'failed_traceroute_execution',
+        error_details: traceroute['error'].nil? ? "not_applicable" : traceroute['error'].to_s
+      )
       next
     end
 
     colos_data = traceroute.dig('result', 0, 'colos', 0)
+    had_error = (not colos_data['error'].nil?)
+    if had_error
+      log_skipped_traceroute(
+        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
+        skip_reason: 'traceroute_error',
+        error_details: colos_data['error']
+      )
+      next
+    end
+
     target_summary = colos_data['target_summary']
-    hops = colos_data['hops']
+    hops = colos_data['hops'] || []
     traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
 
     colo_result_meta = colos_data['colo']
@@ -400,9 +441,10 @@ end
 
 append_to_csv(
   File.join(options[:output_dir], 'traceroute_summary.csv'), csv_data
-)
+) unless csv_data.empty?
+
 append_to_csv(
   File.join(options[:output_dir], 'skipped_colos.csv'), skipped_data
-)
+) unless skipped_data.empty?
 
 puts "Data collection complete. Results saved in #{options[:output_dir]}"
