@@ -1,5 +1,6 @@
 *.txt
 *.log
 results/*
+cached/*
 
 !curl-format.txt
