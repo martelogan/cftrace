@@ -61,7 +61,7 @@ GCP_REGIONS = {
   "asia-southeast1" => { lat: 1.3521, long: 103.8198, city: "Singapore, Singapore" },
   "asia-southeast2" => { lat: -6.2088, long: 106.8456, city: "Jakarta, Indonesia" },
   "asia-south1" => { lat: 19.0760, long: 72.8777, city: "Mumbai, India" },
-  "asia-south2" => { lat: 12.9716, long: 77.5946, city: "Bangalore, India" },
+  "asia-South2" => { lat: 12.9716, long: 77.5946, city: "Bangalore, India" },
   "asia-northeast1" => { lat: 35.6895, long: 139.6917, city: "Tokyo, Japan" },
   "asia-northeast2" => { lat: 37.5665, long: 126.9780, city: "Seoul, South Korea" },
   "asia-northeast3" => { lat: 22.3964, long: 114.1095, city: "Hong Kong, Hong Kong" },
@@ -92,7 +92,8 @@ options = {
   target_is_gcp: DEFAULT_TARGET_IS_GCP,
   verbose: true,
   generate_matrix: true,
-  postprocess_only: false
+  generate_aggregates: true,
+  postprocess_only: true
 }
 
 OptionParser.new do |opts|
@@ -134,6 +135,9 @@ OptionParser.new do |opts|
   end
   opts.on("--generate-matrix", "Generate GCP-to-Colo RTT matrix from existing summary") do
     options[:generate_matrix] = true
+  end
+  opts.on("--generate-aggregates", "Generate aggregate statistics from existing summary") do
+    options[:generate_aggregates] = true
   end
   opts.on("--postprocess-only", "Skip data collection and only generate RTT matrix") do
     options[:postprocess_only] = true
@@ -614,22 +618,198 @@ def generate_rtt_matrix(summary_file, output_dir, colo_key: 'start_colo', region
   puts "RTT matrix generated: #{matrix_file}"
 end
 
-if options[:generate_matrix] || options[:postprocess_only]
-  summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
-  summary_file = File.join(options[:output_dir], summary_filename)
+def calculate_percentile(values, percentile)
+  return nil if values.empty?
+  sorted = values.sort
+  k = (percentile * (sorted.length - 1)).floor
+  sorted[k]
+end
 
-  # Generate standard colo-level matrix
-  generate_rtt_matrix(summary_file, options[:output_dir], region: options[:region])
+def generate_aggregate_stats(summary_file, output_dir, region: nil)
+  return unless File.exist?(summary_file)
 
-  # If using verbose summary, also generate subcolo matrix
-  if options[:verbose]
-    generate_rtt_matrix(
-      summary_file,
-      options[:output_dir],
-      colo_key: 'start_subcolo',
-      region: options[:region]
-    )
+  # Initialize data structures with all metrics we want to track
+  regional_stats = {}
+  overall_stats = {
+    rtt_ms: [],
+    hops_count: [],
+    std_dev_rtt_ms: [],
+    target_distance_km: [],
+    traceroute_time_ms: [],
+    min_rtt_ms: [],
+    max_rtt_ms: [],
+    samples: []
+  }
+
+  # Read and collect data
+  CSV.foreach(summary_file, headers: true) do |row|
+    next if row['rtt_ms'].nil? || row['rtt_ms'].to_f == 0
+    next if region && row['start_region'] != region
+
+    current_region = row['start_region']
+    regional_stats[current_region] ||= {
+      rtt_ms: [],
+      hops_count: [],
+      std_dev_rtt_ms: [],
+      target_distance_km: [],
+      traceroute_time_ms: [],
+      min_rtt_ms: [],
+      max_rtt_ms: [],
+      samples: []
+    }
+
+    # Store full sample data for finding min/max tuples
+    sample = {
+      cf_colo: row['start_colo'],
+      subcolo: row['start_subcolo'],
+      gcp_region: row['approx_nearest_gcp'],
+      rtt_ms: row['rtt_ms'].to_f,
+      hops_count: row['hops_count'].to_i,
+      target_distance_km: row['target_distance_km'].to_f,
+      traceroute_time_ms: row['traceroute_time_ms'].to_f,
+      min_rtt_ms: row['min_rtt_ms'].to_f,
+      max_rtt_ms: row['max_rtt_ms'].to_f,
+      std_dev_rtt_ms: row['std_dev_rtt_ms'].to_f
+    }
+
+    regional_stats[current_region][:samples] << sample
+    overall_stats[:samples] ||= []
+    overall_stats[:samples] << sample
+
+    # Collect numeric values for percentile calculations
+    %w[rtt_ms hops_count target_distance_km traceroute_time_ms min_rtt_ms max_rtt_ms std_dev_rtt_ms].each do |metric|
+      next if row[metric].nil? || row[metric] == 'unknown'
+      value = metric == 'hops_count' ? row[metric].to_i : row[metric].to_f
+      next if value == 0
+
+      regional_stats[current_region][metric.to_sym] << value
+      overall_stats[metric.to_sym] << value
+    end
   end
+
+  # Generate aggregate statistics
+  aggregate_rows = []
+
+  # Process regional statistics
+  regional_stats.each do |region, data|
+    aggregate_rows << generate_stat_row(data, region)
+  end
+
+  # Process overall statistics
+  aggregate_rows << generate_stat_row(overall_stats, 'overall')
+
+  # Write to CSV
+  region_suffix = region ? "_#{region}" : ""
+  output_file = File.join(output_dir, "traceroute_aggregates#{region_suffix}.csv")
+
+  CSV.open(output_file, 'w') do |csv|
+    csv << aggregate_rows.first.keys
+    aggregate_rows.each { |row| csv << row.values }
+  end
+
+  puts "Aggregate statistics generated: #{output_file}"
+end
+
+def generate_stat_row(data, region_name)
+  # Define metrics and their order
+  primary_metrics = ['rtt_ms', 'hops_count', 'std_dev_rtt_ms']
+  secondary_metrics = ['target_distance_km', 'traceroute_time_ms']
+  all_metrics = primary_metrics + secondary_metrics
+
+  row = {
+    region: region_name,
+    sample_size: data[:samples].size
+  }
+
+  all_metrics.each do |metric|
+    values = data[metric.to_sym]
+    next if values.nil? || values.empty?
+
+    case metric
+    when 'std_dev_rtt_ms'
+      # For std dev, we only take the average
+      row["#{metric}_avg"] = (values.sum / values.size).round(2)
+    when 'min_rtt_ms'
+      # For min_rtt, we take the minimum of minimums
+      row["#{metric}"] = values.min.round(2)
+    when 'max_rtt_ms'
+      # For max_rtt, we take the maximum of maximums
+      row["#{metric}"] = values.max.round(2)
+    else
+      # For other metrics, calculate all statistics
+      row["#{metric}_avg"] = (values.sum / values.size).round(2)
+      row["#{metric}_min"] = values.min.round(2)
+      row["#{metric}_max"] = values.max.round(2)
+      row["#{metric}_p50"] = calculate_percentile(values, 0.50).round(2)
+      row["#{metric}_p90"] = calculate_percentile(values, 0.90).round(2)
+
+      # Find tuples for min/max values
+      min_sample = data[:samples].min_by { |s| s[metric.to_sym] }
+      max_sample = data[:samples].max_by { |s| s[metric.to_sym] }
+
+      # Include either subcolo or colo (preferring subcolo) in tuples
+      min_tuple = [
+        min_sample[:subcolo] || min_sample[:cf_colo],
+        min_sample[:gcp_region],
+        "#{min_sample[:target_distance_km].round}km"
+      ].compact.join(',')
+
+      max_tuple = [
+        max_sample[:subcolo] || max_sample[:cf_colo],
+        max_sample[:gcp_region],
+        "#{max_sample[:target_distance_km].round}km"
+      ].compact.join(',')
+
+      row["#{metric}_min_tuple"] = min_tuple
+      row["#{metric}_max_tuple"] = max_tuple
+    end
+  end
+
+  # Ensure consistent column ordering
+  ordered_row = { region: row[:region], sample_size: row[:sample_size] }
+
+  # Process each metric in order
+  all_metrics.each do |metric|
+    if metric == 'std_dev_rtt_ms'
+      # Add std_dev right after hops_count
+      ordered_row["#{metric}_avg"] = row["#{metric}_avg"]
+    else
+      # Add columns in specified order
+      ['avg', 'min', 'max', 'p50', 'p90'].each do |stat|
+        key = "#{metric}_#{stat}"
+        ordered_row[key] = row[key] if row.key?(key)
+      end
+
+      # Add tuples after all stats
+      ordered_row["#{metric}_min_tuple"] = row["#{metric}_min_tuple"] if row.key?("#{metric}_min_tuple")
+      ordered_row["#{metric}_max_tuple"] = row["#{metric}_max_tuple"] if row.key?("#{metric}_max_tuple")
+    end
+  end
+
+  ordered_row
+end
+
+summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
+summary_file = File.join(options[:output_dir], summary_filename)
+
+# Generate standard colo-level matrix
+if options[:generate_matrix]
+  generate_rtt_matrix(summary_file, options[:output_dir], region: options[:region])
+end
+
+# Generate aggregate statistics only if requested
+if options[:generate_aggregates]
+  generate_aggregate_stats(summary_file, options[:output_dir], region: options[:region])
+end
+
+# If using verbose summary, also generate subcolo matrix
+if options[:verbose] && options[:generate_matrix]
+  generate_rtt_matrix(
+    summary_file,
+    options[:output_dir],
+    colo_key: 'start_subcolo',
+    region: options[:region]
+  )
 end
 
 puts "Data collection complete. Results saved in #{options[:output_dir]}"
