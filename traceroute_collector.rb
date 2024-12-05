@@ -70,6 +70,18 @@ GCP_REGIONS = {
   "africa-south1" => { lat: -26.2041, long: 28.0473, city: "Johannesburg, South Africa" }
 }
 
+REGION_PRECEDENCE = ['na', 'apac', 'eu', 'latam', 'me', 'afr', 'unknown']
+GCP_REGION_PRECEDENCE = [
+  /^us-/,           # US regions first
+  /^northamerica-/, # Then other NA
+  /^asia-/,         # Then Asia
+  /^australia-/,    # Then Europe
+  /^europe-/,       # Then Australia
+  /^southamerica-/, # Then South America
+  /^me-/,          # Then Middle East
+  /^africa-/        # Then Africa
+]
+
 options = {
   traceroute_uri: DEFAULT_TRACEROUTE_URI,
   output_dir: DEFAULT_OUTPUT_DIR,
@@ -78,7 +90,9 @@ options = {
   colos: nil,
   region: nil,
   target_is_gcp: DEFAULT_TARGET_IS_GCP,
-  verbose: false
+  verbose: true,
+  generate_matrix: true,
+  postprocess_only: false
 }
 
 OptionParser.new do |opts|
@@ -117,6 +131,12 @@ OptionParser.new do |opts|
   end
   opts.on("--verbose", "Output one row per subcolo in traceroute results") do
     options[:verbose] = true
+  end
+  opts.on("--generate-matrix", "Generate GCP-to-Colo RTT matrix from existing summary") do
+    options[:generate_matrix] = true
+  end
+  opts.on("--postprocess-only", "Skip data collection and only generate RTT matrix") do
+    options[:postprocess_only] = true
   end
 end.parse!
 
@@ -366,145 +386,250 @@ def log_skipped_traceroute(
   sleep 2
 end
 
-Dir.mkdir(options[:output_dir]) unless Dir.exist?(options[:output_dir])
-cf_colos = load_colo_data(options[:cf_colo_file])
-unless options[:colos]
-  options[:colos] = fetch_colos_by_region(cf_colos, options[:region])
-end
+unless options[:postprocess_only]
+  Dir.mkdir(options[:output_dir]) unless Dir.exist?(options[:output_dir])
+  cf_colos = load_colo_data(options[:cf_colo_file])
+  unless options[:colos]
+    options[:colos] = fetch_colos_by_region(cf_colos, options[:region])
+  end
 
-csv_data = []
-skipped_data = []
-options[:colos].each do |colo|
-  sleep 2
-  colo_info = cf_colos[colo.upcase]
-  colo_name = colo.downcase
-  next unless colo_info
+  csv_data = []
+  skipped_data = []
+  options[:colos].each do |colo|
+    sleep 2
+    colo_info = cf_colos[colo.upcase]
+    colo_name = colo.downcase
+    next unless colo_info
 
-  region_short = BUSINESS_REGIONS[colo_info['region']] || 'unknown'
-  region_dir = File.join(options[:output_dir], region_short, colo_name)
-  FileUtils.mkdir_p(region_dir)
+    region_short = BUSINESS_REGIONS[colo_info['region']] || 'unknown'
+    region_dir = File.join(options[:output_dir], region_short, colo_name)
+    FileUtils.mkdir_p(region_dir)
 
-  options[:targets].each do |target|
-    skip_reason = nil
-    error_details = "not_applicable"
+    options[:targets].each do |target|
+      skip_reason = nil
+      error_details = "not_applicable"
 
-    uri = "#{options[:traceroute_uri]}?colos=#{colo_name}&targets=#{target[:ip]}"
-    puts "Fetching #{colo_name} traceroute to #{target[:ip]} ..."
-    puts "URI: #{uri}"
-    response = Net::HTTP.get(URI(uri))
+      uri = "#{options[:traceroute_uri]}?colos=#{colo_name}&targets=#{target[:ip]}"
+      puts "Fetching #{colo_name} traceroute to #{target[:ip]} ..."
+      puts "URI: #{uri}"
+      response = Net::HTTP.get(URI(uri))
 
-    no_response = response.nil? || response.empty?
-    traceroute = JSON.parse(response) unless no_response rescue nil
-    no_traceroute = traceroute.nil? || (not traceroute.is_a?(Hash))
-    if no_response || no_traceroute || traceroute['result'].nil?
-      log_skipped_traceroute(
-        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
-        skip_reason: 'no_traceroute_response',
-        error_details: 'not_applicable'
-      )
-      next
-    end
-
-    failed_execution = (not traceroute['success'])
-    if failed_execution
-      log_skipped_traceroute(
-        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
-        skip_reason: 'failed_traceroute_execution',
-        error_details: traceroute['error'].nil? ? "not_applicable" : traceroute['error'].to_s
-      )
-      next
-    end
-
-    colos_results = traceroute.dig('result', 0, 'colos') || []
-    colos_to_process = options[:verbose] ? colos_results : [colos_results[0]]
-
-    json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
-    File.write(json_file, JSON.pretty_generate(traceroute))
-
-    # TODO: support multiple traceroutes option for same subcolo
-    repeated_subcolos = Set.new
-    colos_to_process.each do |colos_data|
-      next unless colos_data
-
-      had_error = (not colos_data['error'].nil?)
-      if had_error
+      no_response = response.nil? || response.empty?
+      traceroute = JSON.parse(response) unless no_response rescue nil
+      no_traceroute = traceroute.nil? || (not traceroute.is_a?(Hash))
+      if no_response || no_traceroute || traceroute['result'].nil?
         log_skipped_traceroute(
-          skipped_data: skipped_data, region_short: region_short, colo_name: colo_name,
-          target: target, skip_reason: 'traceroute_error', error_details: colos_data['error']
+          skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
+          skip_reason: 'no_traceroute_response',
+          error_details: 'not_applicable'
         )
         next
       end
 
-      colo_result_meta = colos_data['colo']
-      subcolo = colo_result_meta['name'] || 'unknown'
-      next if repeated_subcolos.include?(subcolo)
+      failed_execution = (not traceroute['success'])
+      if failed_execution
+        log_skipped_traceroute(
+          skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
+          skip_reason: 'failed_traceroute_execution',
+          error_details: traceroute['error'].nil? ? "not_applicable" : traceroute['error'].to_s
+        )
+        next
+      end
 
-      puts "Processing subcolo=#{subcolo} for colo=#{colo_name}..."
+      colos_results = traceroute.dig('result', 0, 'colos') || []
+      colos_to_process = options[:verbose] ? colos_results : [colos_results[0]]
 
-      repeated_subcolos.add(subcolo) # allows 'unknown' subcolo to occur exactly once per top-level colo
+      json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
+      File.write(json_file, JSON.pretty_generate(traceroute))
 
-      json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}_#{subcolo}.json")
-      File.write(json_file, JSON.pretty_generate(colos_data))
+      # TODO: support multiple traceroutes option for same subcolo
+      repeated_subcolos = Set.new
+      colos_to_process.each do |colos_data|
+        next unless colos_data
 
-      target_summary = colos_data['target_summary']
-      hops = colos_data['hops'] || []
-      traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
+        had_error = (not colos_data['error'].nil?)
+        if had_error
+          log_skipped_traceroute(
+            skipped_data: skipped_data, region_short: region_short, colo_name: colo_name,
+            target: target, skip_reason: 'traceroute_error', error_details: colos_data['error']
+          )
+          next
+        end
 
-      colo_city_full = colo_result_meta['city'] || colo_info['city'] || 'unknown'
-      colo_city_parts = colo_city_full.split(',')
-      colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
+        colo_result_meta = colos_data['colo']
+        subcolo = colo_result_meta['name'] || 'unknown'
+        next if repeated_subcolos.include?(subcolo)
 
-      summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
-      approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
-        final_geo[:lat], final_geo[:long]
-      ) : 'not_applicable'
-      approx_gcp_city = approx_nearest_gcp == 'not_applicable' ? 'not_applicable'
-        : GCP_REGIONS[approx_nearest_gcp][:city]
+        puts "Processing subcolo=#{subcolo} for colo=#{colo_name}..."
 
-      congested_hops, slowest_hops = collect_hop_data(hops)
+        repeated_subcolos.add(subcolo) # allows 'unknown' subcolo to occur exactly once per top-level colo
 
-      csv_data << {
-        start_region: region_short,
-        start_colo: colo_name,
-        start_subcolo: subcolo,
-        trace_target: target[:name],
-        rtt_ms: summary_stats[:rtt_ms] || 0,
-        hops_count: hops.size,
-        start_city: colo_city_full,
-        approx_final_hop: final_geo[:city],
-        approx_nearest_gcp: approx_nearest_gcp,
-        target_distance_km: orthodromic_distance(
-          colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
-        ),
-        approx_gcp_city: approx_gcp_city,
-        target_ip: target[:ip],
-        target_domain: target[:domain],
-        traceroute_time_ms: traceroute_time_ms,
-        traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
-        min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
-        max_rtt_ms: summary_stats[:max_rtt_ms] || 0,
-        std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
-        colo_lat: colo_info['lat'].to_f.round(2),
-        colo_long: colo_info['lon'].to_f.round(2),
-        colo_country: colo_country_short || colo_info['country'],
-        target_lat: final_geo[:lat],
-        target_long: final_geo[:long],
-        target_country: final_geo[:country],
-        congested_hops: congested_hops.to_json,
-        slowest_hops: slowest_hops.to_json
-      }
+        json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}_#{subcolo}.json")
+        File.write(json_file, JSON.pretty_generate(colos_data))
+
+        target_summary = colos_data['target_summary']
+        hops = colos_data['hops'] || []
+        traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
+
+        colo_city_full = colo_result_meta['city'] || colo_info['city'] || 'unknown'
+        colo_city_parts = colo_city_full.split(',')
+        colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
+
+        summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
+        approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
+          final_geo[:lat], final_geo[:long]
+        ) : 'not_applicable'
+        approx_gcp_city = approx_nearest_gcp == 'not_applicable' ? 'not_applicable'
+          : GCP_REGIONS[approx_nearest_gcp][:city]
+
+        congested_hops, slowest_hops = collect_hop_data(hops)
+
+        csv_data << {
+          start_region: region_short,
+          start_colo: colo_name,
+          start_subcolo: subcolo,
+          trace_target: target[:name],
+          rtt_ms: summary_stats[:rtt_ms] || 0,
+          hops_count: hops.size,
+          start_city: colo_city_full,
+          approx_final_hop: final_geo[:city],
+          approx_nearest_gcp: approx_nearest_gcp,
+          target_distance_km: orthodromic_distance(
+            colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
+          ),
+          approx_gcp_city: approx_gcp_city,
+          target_ip: target[:ip],
+          target_domain: target[:domain],
+          traceroute_time_ms: traceroute_time_ms,
+          traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
+          min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
+          max_rtt_ms: summary_stats[:max_rtt_ms] || 0,
+          std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
+          colo_lat: colo_info['lat'].to_f.round(2),
+          colo_long: colo_info['lon'].to_f.round(2),
+          colo_country: colo_country_short || colo_info['country'],
+          target_lat: final_geo[:lat],
+          target_long: final_geo[:long],
+          target_country: final_geo[:country],
+          congested_hops: congested_hops.to_json,
+          slowest_hops: slowest_hops.to_json
+        }
+      end
     end
   end
+
+  summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
+  append_to_csv(
+    File.join(options[:output_dir], summary_filename), csv_data
+  ) unless csv_data.empty?
+
+  skipped_colos_filename = options[:verbose] ? 'skipped_colos_verbose.csv' : 'skipped_colos.csv'
+  append_to_csv(
+    File.join(options[:output_dir], skipped_colos_filename), skipped_data
+  ) unless skipped_data.empty?
 end
 
-summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
-append_to_csv(
-  File.join(options[:output_dir], summary_filename), csv_data
-) unless csv_data.empty?
+def generate_rtt_matrix(summary_file, output_dir, colo_key: 'start_colo', region: nil)
+  return unless File.exist?(summary_file)
 
-skipped_colos_filename = options[:verbose] ? 'skipped_colos_verbose.csv' : 'skipped_colos.csv'
-append_to_csv(
-  File.join(options[:output_dir], skipped_colos_filename), skipped_data
-) unless skipped_data.empty?
+  matrix_data = {}
+  cf_colos = Set.new
+  gcp_regions = Set.new
+  cf_colo_metadata = {}
+  gcp_metadata = {}
+
+  # Read the summary CSV and collect data
+  CSV.foreach(summary_file, headers: true) do |row|
+    next unless row['approx_nearest_gcp'] != 'not_applicable'
+
+    gcp_region = row['approx_nearest_gcp']
+    cf_colo = row[colo_key]
+    rtt = row['rtt_ms'].to_f
+
+    matrix_data[gcp_region] ||= {}
+    matrix_data[gcp_region][cf_colo] ||= []
+    matrix_data[gcp_region][cf_colo] << rtt
+
+    cf_colos.add(cf_colo)
+    gcp_regions.add(gcp_region)
+
+    # Collect metadata
+    cf_colo_metadata[cf_colo] = {
+      city: row['start_city'],
+      region: row['start_region']
+    }
+    gcp_metadata[gcp_region] = {
+      city: row['approx_gcp_city']
+    }
+  end
+
+  # Calculate averages
+  matrix = {}
+  gcp_regions.each do |gcp|
+    matrix[gcp] = {}
+    cf_colos.each do |colo|
+      rtts = matrix_data.dig(gcp, colo) || []
+      matrix[gcp][colo] = rtts.empty? ? nil : (rtts.sum / rtts.size).round(2)
+    end
+  end
+
+  # Sort CF colos by region precedence and then alphabetically
+  sorted_cf_colos = cf_colos.to_a.sort_by do |colo|
+    [
+      REGION_PRECEDENCE.index(cf_colo_metadata[colo][:region]) || REGION_PRECEDENCE.size,
+      colo
+    ]
+  end
+
+  # Sort GCP regions by precedence pattern matching
+  sorted_gcp_regions = gcp_regions.to_a.sort_by do |region|
+    [
+      GCP_REGION_PRECEDENCE.index { |pattern| region.match?(pattern) } || GCP_REGION_PRECEDENCE.size,
+      region
+    ]
+  end
+
+  region_suffix = region ? "_#{region}" : ""
+  colo_type = colo_key == 'start_subcolo' ? 'subcolos' : 'colos'
+  matrix_file = File.join(output_dir, "#{colo_type}_rtt_matrix#{region_suffix}.csv")
+
+  CSV.open(matrix_file, 'w') do |csv|
+    # Metadata rows
+    csv << [''] + [''] + sorted_cf_colos.map { |colo| cf_colo_metadata[colo][:city] }
+    csv << [''] + [''] + sorted_cf_colos.map { |colo| cf_colo_metadata[colo][:region] }
+
+    # Header row with CF colos
+    csv << [''] + [''] + sorted_cf_colos
+
+    # Data rows
+    sorted_gcp_regions.each do |gcp|
+      row = [gcp_metadata[gcp][:city], gcp]
+      sorted_cf_colos.each do |colo|
+        row << (matrix[gcp][colo] || 'N/A')
+      end
+      csv << row
+    end
+  end
+
+  puts "RTT matrix generated: #{matrix_file}"
+end
+
+if options[:generate_matrix] || options[:postprocess_only]
+  summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
+  summary_file = File.join(options[:output_dir], summary_filename)
+
+  # Generate standard colo-level matrix
+  generate_rtt_matrix(summary_file, options[:output_dir], region: options[:region])
+
+  # If using verbose summary, also generate subcolo matrix
+  if options[:verbose]
+    generate_rtt_matrix(
+      summary_file,
+      options[:output_dir],
+      colo_key: 'start_subcolo',
+      region: options[:region]
+    )
+  end
+end
 
 puts "Data collection complete. Results saved in #{options[:output_dir]}"
