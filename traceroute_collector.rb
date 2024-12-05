@@ -196,19 +196,47 @@ def orthodromic_distance(lat1, lon1, lat2, lon2)
   (EARTH_RADIUS_KM * c).round(2)
 end
 
-def infer_final_hop_geo(hops, target_ip)
-  hops&.reverse_each do |hop|
-    hop['nodes']&.reverse_each do |node|
-      next unless node['ip']
+def analyze_last_valid_hop(hops, target_ip)
+  return [nil, nil] if hops.nil? || hops.empty?
 
-      puts "Checking IP #{node['ip']} for unique location..."
-      geo_info = fetch_geoip_info(node['ip'], skip_anycast: true)
-      return geo_info if geo_info # Return the first unique location found
+  summary_stats = nil
+  geo_info = nil
+
+  hops.reverse_each do |hop|
+    hop['nodes']&.each do |node|
+      # Skip completely invalid/empty nodes
+      next if node['ip'].nil? || node['ip'].empty? ||
+              node['name'] == 'NO RESPONSE'
+
+      # Collect summary_stats if we haven't found valid ones yet
+      # (including target_ip if it has valid summary_stats)
+      if summary_stats.nil? && node['mean_rtt_ms'] != 0
+        summary_stats = {
+          rtt_ms: (node['mean_rtt_ms'] || 0).to_i,
+          min_rtt_ms: (node['min_rtt_ms'] || 0).to_f.round(2),
+          max_rtt_ms: (node['max_rtt_ms'] || 0).to_f.round(2),
+          std_dev_rtt_ms: (node['std_dev_rtt_ms'] || 0).to_f.round(2),
+          packet_count: node['packet_count']
+        }
+      end
+
+      # Collect geo info if we haven't found it yet
+      # (skip target_ip for geo lookup)
+      if geo_info.nil? && node['ip'] != target_ip
+        puts "Checking IP #{node['ip']} for unique location..."
+        geo_info = fetch_geoip_info(node['ip'], skip_anycast: true)
+      end
+
+      # Break early if we have both pieces of information
+      break if summary_stats && geo_info
     end
+
+    # Break early if we have both pieces of information
+    break if summary_stats && geo_info
   end
 
-  puts "Unable to infer final hop geo. Using default unknown values."
-  {
+  # Return default geo_info if none found
+  geo_info ||= {
     ip: 'unknown',
     city: 'unknown',
     region: 'unknown',
@@ -216,6 +244,16 @@ def infer_final_hop_geo(hops, target_ip)
     lat: 'unknown',
     long: 'unknown'
   }
+
+  summary_stats ||= {
+    rtt_ms: nil,
+    min_rtt_ms: nil,
+    max_rtt_ms: nil,
+    std_dev_rtt_ms: nil,
+    packet_count: nil
+  }
+
+  [summary_stats, geo_info]
 end
 
 def map_gcp_region(lat, long)
@@ -394,7 +432,7 @@ options[:colos].each do |colo|
     colo_city_parts = colo_city_full.split(',')
     colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
 
-    final_geo = infer_final_hop_geo(hops, target[:ip])
+    summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
     approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
       final_geo[:lat], final_geo[:long]
     ) : 'not_applicable'
@@ -410,7 +448,7 @@ options[:colos].each do |colo|
       start_region: region_short,
       start_colo: colo_name,
       trace_target: target[:name],
-      rtt_ms: (target_summary['mean_rtt_ms'] || 0).to_i,
+      rtt_ms: summary_stats[:rtt_ms] || 0,
       hops_count: hops.size,
       start_city: colo_city_full,
       approx_final_hop: final_geo[:city],
@@ -423,10 +461,10 @@ options[:colos].each do |colo|
       target_ip: target[:ip],
       target_domain: target[:domain],
       traceroute_time_ms: traceroute_time_ms,
-      traceroute_packet_count: target_summary['packet_count'] || 'unknown',
-      min_rtt_ms: (target_summary['min_rtt_ms'] || 0).to_f.round(2),
-      max_rtt_ms: (target_summary['max_rtt_ms'] || 0).to_f.round(2),
-      std_dev_rtt_ms: (target_summary['std_dev_rtt_ms'] || 0).to_f.round(2),
+      traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
+      min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
+      max_rtt_ms: summary_stats[:max_rtt_ms] || 0,
+      std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
       colo_lat: colo_info['lat'].to_f.round(2),
       colo_long: colo_info['lon'].to_f.round(2),
       colo_country: colo_country_short || colo_info['country'],
