@@ -1,0 +1,47 @@
+{
+    "ABQ": {
+        "cca2": "US",
+        "city": "Albuquerque",
+        "country": "United States",
+        "lat": 35.0844,
+        "lon": -106.6504,
+        "name": "Albuquerque, United States",
+        "region": "North America"
+    },
+    "GUA": {
+        "cca2": "GT",
+        "city": "Guatemala City",
+        "country": "Guatemala",
+        "lat": 14.5832996368,
+        "lon": -90.5274963379,
+        "name": "Guatemala City, Guatemala",
+        "region": "North America"
+    },
+    "ACC": {
+        "cca2": "GH",
+        "city": "Accra",
+        "country": "Ghana",
+        "lat": 5.614818,
+        "lon": -0.205874,
+        "name": "Accra, Ghana",
+        "region": "Africa"
+    },
+    "YYZ": {
+        "cca2": "CA",
+        "city": "Toronto",
+        "country": "Canada",
+        "lat": 43.6772003174,
+        "lon": -79.6305999756,
+        "name": "Toronto, ON, Canada",
+        "region": "North America"
+    },
+    "ZAG": {
+        "cca2": "HR",
+        "city": "Zagreb",
+        "country": "Croatia",
+        "lat": 45.7429008484,
+        "lon": 16.0687999725,
+        "name": "Zagreb, Croatia",
+        "region": "Europe"
+    }
+}
