@@ -516,7 +516,8 @@ unless options[:postprocess_only]
           target_long: final_geo[:long],
           target_country: final_geo[:country],
           congested_hops: congested_hops.to_json,
-          slowest_hops: slowest_hops.to_json
+          slowest_hops: slowest_hops.to_json,
+          traceroute_uri: uri
         }
       end
     end
