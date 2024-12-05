@@ -475,7 +475,17 @@ unless options[:postprocess_only]
         hops = colos_data['hops'] || []
         traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
 
-        colo_city_full = colo_result_meta['city'] || colo_info['city'] || 'unknown'
+        colo_city_full = colo_result_meta['city']
+        if colo_info['city'] && colo_info['city'] != colo_city_full&.split(',').first
+          colo_info_name = colo_info['name']
+          name_parts = colo_info_name&.split(',') || [colo_info['city']]
+          province_code = name_parts.size > 2 ? name_parts[1] : nil
+          if province_code.nil? || province_code.empty?
+            colo_city_full = "#{colo_info['city']}, #{colo_info['cca2']}" rescue 'unknown'
+          else
+            colo_city_full = "#{colo_info['city']}, #{province_code}, #{colo_info['cca2']}" rescue 'unknown'
+          end
+        end
         colo_city_parts = colo_city_full.split(',')
         colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
 
@@ -488,6 +498,10 @@ unless options[:postprocess_only]
 
         congested_hops, slowest_hops = collect_hop_data(hops)
 
+        approx_final_hop = (
+          final_geo[:city].nil? || final_geo[:city].gsub(/[\s,]+/, '').empty? ? 'unknown' : final_geo[:city]
+        )
+
         csv_data << {
           start_region: region_short,
           start_colo: colo_name,
@@ -496,7 +510,7 @@ unless options[:postprocess_only]
           rtt_ms: summary_stats[:rtt_ms] || 0,
           hops_count: hops.size,
           start_city: colo_city_full,
-          approx_final_hop: final_geo[:city],
+          approx_final_hop: approx_final_hop,
           approx_nearest_gcp: approx_nearest_gcp,
           target_distance_km: orthodromic_distance(
             colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
@@ -511,7 +525,7 @@ unless options[:postprocess_only]
           std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
           colo_lat: colo_info['lat'].to_f.round(2),
           colo_long: colo_info['lon'].to_f.round(2),
-          colo_country: colo_country_short || colo_info['country'],
+          colo_country: colo_country_short || colo_info['cca2'] || colo_info['country'],
           target_lat: final_geo[:lat],
           target_long: final_geo[:long],
           target_country: final_geo[:country],
