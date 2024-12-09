@@ -62,7 +62,7 @@ GCP_REGIONS = {
   "asia-southeast1" => { lat: 1.3521, long: 103.8198, city: "Singapore, Singapore" },
   "asia-southeast2" => { lat: -6.2088, long: 106.8456, city: "Jakarta, Indonesia" },
   "asia-south1" => { lat: 19.0760, long: 72.8777, city: "Mumbai, India" },
-  "asia-South2" => { lat: 12.9716, long: 77.5946, city: "Bangalore, India" },
+  "asia-south2" => { lat: 12.9716, long: 77.5946, city: "Bangalore, India" },
   "asia-northeast1" => { lat: 35.6895, long: 139.6917, city: "Tokyo, Japan" },
   "asia-northeast2" => { lat: 37.5665, long: 126.9780, city: "Seoul, South Korea" },
   "asia-northeast3" => { lat: 22.3964, long: 114.1095, city: "Hong Kong, Hong Kong" },
@@ -95,7 +95,9 @@ options = {
   generate_matrix: true,
   generate_aggregates: true,
   postprocess_only: true,
-  keep_sorted: true
+  keep_sorted: true,
+  use_local_json: true,
+  retry_count: 1,
 }
 
 OptionParser.new do |opts|
@@ -146,6 +148,12 @@ OptionParser.new do |opts|
   end
   opts.on("--keep-sorted", "Keep CSV files sorted by region") do
     options[:keep_sorted] = true
+  end
+  opts.on("--use-local-json", "Use local JSON files for traceroute data") do
+    options[:use_local_json] = true
+  end
+  opts.on("--retry-count COUNT", "Number of retries for traceroute data") do |count|
+    options[:retry_count] = count.to_i
   end
 end.parse!
 
@@ -436,12 +444,248 @@ def log_skipped_traceroute(
     start_region: region_short,
     start_colo: colo_name,
     trace_target: target[:name],
+    timestamp: Time.now.strftime('%Y-%m-%d %H:%M:%S'),
     target_ip: target[:ip],
     target_domain: target[:domain],
     skipped_reason: skip_reason,
     error_details: error_details
   }
   sleep 10
+end
+
+def fetch_traceroute(uri:, colo_name:, target:, region_dir:, options:)
+  if options[:use_local_json]
+    json_path = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
+    if File.exist?(json_path)
+      puts "Using local JSON file: #{json_path}"
+      return { response: File.read(json_path) }
+    end
+  end
+
+  puts "Fetching #{colo_name} traceroute to #{target[:ip]} ..."
+  puts "URI: #{uri}"
+  { response: Net::HTTP.get(URI(uri)) }
+rescue StandardError => e
+  { error: e.message }
+end
+
+def process_traceroute_with_retry(
+  colo_info:, uri:, colo_name:, target:, region_dir:, region_short:,
+  options:, skipped_data:, csv_data:, suspicious_data:
+)
+  retries_remaining = options[:retry_count]
+
+  loop do
+    result = fetch_traceroute(
+      uri: uri, colo_name: colo_name, target: target,
+      region_dir: region_dir, options: options
+    )
+
+    response = result[:response]
+    no_response = response.nil? || response.empty?
+    traceroute = JSON.parse(response) unless no_response rescue nil
+    no_traceroute = traceroute.nil? || (not traceroute.is_a?(Hash))
+
+    if result[:error] || no_response || no_traceroute || traceroute['result'].nil?
+      skip_reason = 'no_traceroute_response'
+      error_details = result[:error] || 'not_applicable'
+    elsif not traceroute['success']
+      skip_reason = 'failed_traceroute_execution'
+      error_details = traceroute['error'] || 'not_applicable'
+    end
+
+    if skip_reason && retries_remaining > 0
+      retries_remaining -= 1
+      puts "Retrying due to #{skip_reason}. #{retries_remaining} retries remaining..."
+      sleep(5 * (options[:retry_count] - retries_remaining))
+      next
+    end
+
+    # Log skip if we've exhausted retries
+    if skip_reason
+      log_skipped_traceroute(
+        skipped_data: skipped_data,
+        region_short: region_short,
+        colo_name: colo_name,
+        target: target,
+        skip_reason: skip_reason,
+        error_details: error_details
+      )
+      return
+    end
+
+    process_successful_traceroute(
+      colo_info: colo_info,
+      uri: uri,
+      traceroute: traceroute,
+      region_dir: region_dir,
+      region_short: region_short,
+      colo_name: colo_name,
+      target: target,
+      options: options,
+      csv_data: csv_data,
+      skipped_data: skipped_data,
+      suspicious_data: suspicious_data
+    )
+    return
+  end
+end
+
+def process_successful_traceroute(
+  uri:, colo_info:, traceroute:, region_dir:, region_short:, colo_name:, target:,
+  options:, csv_data:, skipped_data:, suspicious_data:
+)
+  colos_results = traceroute.dig('result', 0, 'colos') || []
+  colos_to_process = options[:verbose] ? colos_results : [colos_results[0]]
+
+  json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
+  File.write(json_file, JSON.pretty_generate(traceroute))
+
+  # TODO: support multiple traceroutes option for same subcolo
+  repeated_subcolos = Set.new
+  colos_to_process.each do |colos_data|
+    next unless colos_data
+
+    had_error = (not colos_data['error'].nil?)
+    if had_error
+      log_skipped_traceroute(
+        skipped_data: skipped_data,
+        region_short: region_short,
+        colo_name: colo_name,
+        target: target,
+        skip_reason: 'traceroute_error',
+        error_details: colos_data['error']
+      )
+      next
+    end
+
+    colo_result_meta = colos_data['colo']
+    subcolo = colo_result_meta['name'] || 'unknown'
+    next if repeated_subcolos.include?(subcolo)
+
+    puts "Processing subcolo=#{subcolo} for colo=#{colo_name}..."
+
+    repeated_subcolos.add(subcolo) # allows 'unknown' subcolo to occur exactly once per top-level colo
+
+    json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}_#{subcolo}.json")
+    File.write(json_file, JSON.pretty_generate(colos_data))
+
+    target_summary = colos_data['target_summary']
+    hops = colos_data['hops'] || []
+    traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
+
+    colo_city_full = colo_result_meta['city']
+    if colo_info['city'] && colo_info['city'] != colo_city_full&.split(',').first
+      colo_info_name = colo_info['name']
+      name_parts = colo_info_name&.split(',') || [colo_info['city']]
+      province_code = name_parts.size > 2 ? name_parts[1] : nil
+      if province_code.nil? || province_code.empty?
+        colo_city_full = "#{colo_info['city']}, #{colo_info['cca2']}" rescue 'unknown'
+      else
+        colo_city_full = "#{colo_info['city']}, #{province_code}, #{colo_info['cca2']}" rescue 'unknown'
+      end
+    end
+    colo_city_parts = colo_city_full.split(',')
+    colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
+
+    puts "Reverse-analyzing #{hops.size} hops from #{colo_city_full} to #{target[:ip]}..."
+    summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
+
+    target_distance_km = orthodromic_distance(
+      colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
+    )
+
+    # Determine if result is suspicious
+    colo_country = colo_country_short || colo_info['cca2'] || colo_info['country']
+    is_cross_country = final_geo[:country] != 'unknown' &&
+                      colo_country != 'unknown' &&
+                      final_geo[:country] != colo_country
+    is_suspicious = is_cross_country &&
+                   summary_stats[:rtt_ms] &&
+                   target_distance_km != 'unknown' &&
+                   target_distance_km > 1000 &&
+                   summary_stats[:rtt_ms] < 5
+
+    if is_suspicious
+      puts "Suspicious traceroute encountered & tracked: " \
+           "region_short=#{region_short} " \
+           "subcolo=#{subcolo} " \
+           "colo_country=#{colo_country} " \
+           "final_geo_country=#{final_geo[:country]} " \
+           "rtt_ms=#{summary_stats[:rtt_ms]}ms " \
+           "target_ip=#{target[:ip]} " \
+           "summary_stats_ip=#{summary_stats[:ip]} " \
+           "final_geo_ip=#{final_geo[:ip]} " \
+           "traceroute_uri=#{uri}"
+
+      suspicious_dir = File.join('suspicious', region_dir)
+      FileUtils.mkdir_p(suspicious_dir)
+
+      json_base = File.join(region_dir, "#{target[:name]}_#{target[:ip]}")
+      suspicious_base = File.join(suspicious_dir, "#{target[:name]}_#{target[:ip]}")
+
+      if File.exist?("#{json_base}.json")
+        FileUtils.mv("#{json_base}.json", "#{suspicious_base}.json")
+      end
+
+      if File.exist?("#{json_base}_#{subcolo}.json")
+        FileUtils.mv("#{json_base}_#{subcolo}.json", "#{suspicious_base}_#{subcolo}.json")
+      end
+
+      puts "Moved suspicious traceroute JSON files to #{suspicious_dir}"
+    end
+
+    approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
+      final_geo[:lat], final_geo[:long]
+    ) : 'not_applicable'
+    approx_gcp_city = approx_nearest_gcp == 'not_applicable' ? 'not_applicable'
+      : GCP_REGIONS[approx_nearest_gcp][:city]
+
+    congested_hops, slowest_hops = collect_hop_data(hops)
+
+    approx_final_hop = (
+      final_geo[:city].nil? || final_geo[:city].gsub(/[\s,]+/, '').empty? ? 'unknown' : final_geo[:city]
+    )
+
+    row_data = {
+      start_region: region_short,
+      start_colo: colo_name,
+      start_subcolo: subcolo,
+      trace_target: target[:name],
+      rtt_ms: summary_stats[:rtt_ms] || 0,
+      hops_count: hops.size,
+      start_city: colo_city_full,
+      approx_final_hop: approx_final_hop,
+      approx_nearest_gcp: approx_nearest_gcp,
+      target_distance_km: target_distance_km,
+      approx_gcp_city: approx_gcp_city,
+      cross_country: is_cross_country,
+      target_ip: target[:ip],
+      target_domain: target[:domain],
+      stats_ip: summary_stats[:ip],
+      final_geo_ip: final_geo[:ip],
+      traceroute_time_ms: traceroute_time_ms,
+      traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
+      min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
+      max_rtt_ms: summary_stats[:max_rtt_ms] || 0,
+      std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
+      colo_lat: colo_info['lat'].to_f.round(2),
+      colo_long: colo_info['lon'].to_f.round(2),
+      colo_country: colo_country_short || colo_info['cca2'] || colo_info['country'],
+      target_lat: final_geo[:lat],
+      target_long: final_geo[:long],
+      target_country: final_geo[:country],
+      congested_hops: congested_hops.to_json,
+      slowest_hops: slowest_hops.to_json,
+      traceroute_uri: uri
+    }
+
+    if is_suspicious
+      suspicious_data << row_data
+    else
+      csv_data << row_data
+    end
+  end
 end
 
 def process_colo(
@@ -456,173 +700,24 @@ def process_colo(
   FileUtils.mkdir_p(region_dir)
 
   options[:targets].each do |target|
-    skip_reason = nil
-    error_details = "not_applicable"
-
     uri = "#{options[:traceroute_uri]}?colos=#{colo_name}&targets=#{target[:ip]}"
-    puts "Fetching #{colo_name} traceroute to #{target[:ip]} ..."
-    puts "URI: #{uri}"
-    response = Net::HTTP.get(URI(uri))
-
-    no_response = response.nil? || response.empty?
-    traceroute = JSON.parse(response) unless no_response rescue nil
-    no_traceroute = traceroute.nil? || (not traceroute.is_a?(Hash))
-    if no_response || no_traceroute || traceroute['result'].nil?
-      log_skipped_traceroute(
-        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
-        skip_reason: 'no_traceroute_response',
-        error_details: 'not_applicable'
-      )
-      next
-    end
-
-    failed_execution = (not traceroute['success'])
-    if failed_execution
-      log_skipped_traceroute(
-        skipped_data: skipped_data, region_short: region_short, colo_name: colo_name, target: target,
-        skip_reason: 'failed_traceroute_execution',
-        error_details: traceroute['error'].nil? ? "not_applicable" : traceroute['error'].to_s
-      )
-      next
-    end
-
-    colos_results = traceroute.dig('result', 0, 'colos') || []
-    colos_to_process = options[:verbose] ? colos_results : [colos_results[0]]
-
-    json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}.json")
-    File.write(json_file, JSON.pretty_generate(traceroute))
-
-    # TODO: support multiple traceroutes option for same subcolo
-    repeated_subcolos = Set.new
-    colos_to_process.each do |colos_data|
-      next unless colos_data
-
-      had_error = (not colos_data['error'].nil?)
-      if had_error
-        log_skipped_traceroute(
-          skipped_data: skipped_data, region_short: region_short, colo_name: colo_name,
-          target: target, skip_reason: 'traceroute_error', error_details: colos_data['error']
-        )
-        next
-      end
-
-      colo_result_meta = colos_data['colo']
-      subcolo = colo_result_meta['name'] || 'unknown'
-      next if repeated_subcolos.include?(subcolo)
-
-      puts "Processing subcolo=#{subcolo} for colo=#{colo_name}..."
-
-      repeated_subcolos.add(subcolo) # allows 'unknown' subcolo to occur exactly once per top-level colo
-
-      json_file = File.join(region_dir, "#{target[:name]}_#{target[:ip]}_#{subcolo}.json")
-      File.write(json_file, JSON.pretty_generate(colos_data))
-
-      target_summary = colos_data['target_summary']
-      hops = colos_data['hops'] || []
-      traceroute_time_ms = colos_data['traceroute_time_ms'] || 'unknown'
-
-      colo_city_full = colo_result_meta['city']
-      if colo_info['city'] && colo_info['city'] != colo_city_full&.split(',').first
-        colo_info_name = colo_info['name']
-        name_parts = colo_info_name&.split(',') || [colo_info['city']]
-        province_code = name_parts.size > 2 ? name_parts[1] : nil
-        if province_code.nil? || province_code.empty?
-          colo_city_full = "#{colo_info['city']}, #{colo_info['cca2']}" rescue 'unknown'
-        else
-          colo_city_full = "#{colo_info['city']}, #{province_code}, #{colo_info['cca2']}" rescue 'unknown'
-        end
-      end
-      colo_city_parts = colo_city_full.split(',')
-      colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
-
-      puts "Reverse-analyzing #{hops.size} hops from #{colo_city_full} to #{target[:ip]}..."
-      summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
-
-      target_distance_km = orthodromic_distance(
-        colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
-      )
-
-      # Determine if result is suspicious
-      colo_country = colo_country_short || colo_info['cca2'] || colo_info['country']
-      is_cross_country = final_geo[:country] != 'unknown' &&
-                        colo_country != 'unknown' &&
-                        final_geo[:country] != colo_country
-      is_suspicious = is_cross_country &&
-                     summary_stats[:rtt_ms] &&
-                     target_distance_km != 'unknown' &&
-                     target_distance_km > 1000 &&
-                     summary_stats[:rtt_ms] < 5
-
-      if is_suspicious
-        puts "Suspicious traceroute encountered & tracked: " \
-             "region_short=#{region_short} " \
-             "subcolo=#{subcolo} " \
-             "colo_country=#{colo_country} " \
-             "final_geo_country=#{final_geo[:country]} " \
-             "rtt_ms=#{summary_stats[:rtt_ms]}ms " \
-             "target_ip=#{target[:ip]} " \
-             "summary_stats_ip=#{summary_stats[:ip]} " \
-             "final_geo_ip=#{final_geo[:ip]} " \
-             "traceroute_uri=#{uri}"
-      end
-
-      approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
-        final_geo[:lat], final_geo[:long]
-      ) : 'not_applicable'
-      approx_gcp_city = approx_nearest_gcp == 'not_applicable' ? 'not_applicable'
-        : GCP_REGIONS[approx_nearest_gcp][:city]
-
-      congested_hops, slowest_hops = collect_hop_data(hops)
-
-      approx_final_hop = (
-        final_geo[:city].nil? || final_geo[:city].gsub(/[\s,]+/, '').empty? ? 'unknown' : final_geo[:city]
-      )
-
-      row_data = {
-        start_region: region_short,
-        start_colo: colo_name,
-        start_subcolo: subcolo,
-        trace_target: target[:name],
-        rtt_ms: summary_stats[:rtt_ms] || 0,
-        hops_count: hops.size,
-        start_city: colo_city_full,
-        approx_final_hop: approx_final_hop,
-        approx_nearest_gcp: approx_nearest_gcp,
-        target_distance_km: target_distance_km,
-        approx_gcp_city: approx_gcp_city,
-        cross_country: is_cross_country,
-        target_ip: target[:ip],
-        target_domain: target[:domain],
-        stats_ip: summary_stats[:ip],
-        final_geo_ip: final_geo[:ip],
-        traceroute_time_ms: traceroute_time_ms,
-        traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
-        min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
-        max_rtt_ms: summary_stats[:max_rtt_ms] || 0,
-        std_dev_rtt_ms: summary_stats[:std_dev_rtt_ms] || 0,
-        colo_lat: colo_info['lat'].to_f.round(2),
-        colo_long: colo_info['lon'].to_f.round(2),
-        colo_country: colo_country_short || colo_info['cca2'] || colo_info['country'],
-        target_lat: final_geo[:lat],
-        target_long: final_geo[:long],
-        target_country: final_geo[:country],
-        congested_hops: congested_hops.to_json,
-        slowest_hops: slowest_hops.to_json,
-        traceroute_uri: uri
-      }
-
-      if is_suspicious
-        suspicious_data << row_data
-      else
-        csv_data << row_data
-      end
-    end
+    process_traceroute_with_retry(
+      colo_info: colo_info,
+      uri: uri,
+      colo_name: colo_name,
+      target: target,
+      region_dir: region_dir,
+      region_short: region_short,
+      options: options,
+      csv_data: csv_data,
+      skipped_data: skipped_data,
+      suspicious_data: suspicious_data
+    )
   end
 rescue StandardError => e
   error_msg = "#{e.class}: #{e.message}\n#{e.backtrace.join("\n")}"
   puts "Error processing colo #{colo_name}: #{error_msg}"
 
-  # Log the error for each target since we're aborting the entire colo
   options[:targets].each do |target|
     log_skipped_traceroute(
       skipped_data: skipped_data,
