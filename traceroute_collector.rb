@@ -400,9 +400,11 @@ def append_to_csv(file, data)
 
   # Sort new data by region precedence
   sorted_data = data.sort_by do |row|
+    # Convert to string to ensure consistent comparison
+    region = row[:start_region] || row['start_region'] || 'unknown'
     [
-      REGION_PRECEDENCE.index(row[:start_region] || row['start_region']) || REGION_PRECEDENCE.size,
-      row
+      REGION_PRECEDENCE.index(region) || REGION_PRECEDENCE.size,
+      region.to_s
     ]
   end
 
