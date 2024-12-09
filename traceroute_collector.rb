@@ -144,6 +144,9 @@ OptionParser.new do |opts|
   opts.on("--postprocess-only", "Skip data collection and only generate RTT matrix") do
     options[:postprocess_only] = true
   end
+  opts.on("--keep-sorted", "Keep CSV files sorted by region") do
+    options[:keep_sorted] = true
+  end
 end.parse!
 
 if options[:colos] && options[:region]
@@ -382,9 +385,11 @@ def sort_csv_file(file_path)
 
   # Sort rows by region precedence
   sorted_rows = rows.sort_by do |row|
+    # Convert to string to ensure consistent comparison
+    region = row['start_region'] || 'unknown'
     [
-      REGION_PRECEDENCE.index(row['start_region']) || REGION_PRECEDENCE.size,
-      row
+      REGION_PRECEDENCE.index(region) || REGION_PRECEDENCE.size,
+      region.to_s
     ]
   end
 
@@ -395,7 +400,7 @@ def sort_csv_file(file_path)
   end
 end
 
-def append_to_csv(file, data)
+def append_to_csv(file, data, keep_sorted: true)
   return if data.empty?
 
   # Sort new data by region precedence
@@ -415,7 +420,7 @@ def append_to_csv(file, data)
   end
 
   # Sort entire file if keep_sorted is enabled
-  sort_csv_file(file) if options[:keep_sorted]
+  sort_csv_file(file) if keep_sorted
 end
 
 def log_skipped_traceroute(
@@ -533,6 +538,10 @@ def process_colo(
       puts "Reverse-analyzing #{hops.size} hops from #{colo_city_full} to #{target[:ip]}..."
       summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
 
+      target_distance_km = orthodromic_distance(
+        colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
+      )
+
       # Determine if result is suspicious
       colo_country = colo_country_short || colo_info['cca2'] || colo_info['country']
       is_cross_country = final_geo[:country] != 'unknown' &&
@@ -540,6 +549,8 @@ def process_colo(
                         final_geo[:country] != colo_country
       is_suspicious = is_cross_country &&
                      summary_stats[:rtt_ms] &&
+                     target_distance_km != 'unknown' &&
+                     target_distance_km > 1000 &&
                      summary_stats[:rtt_ms] < 5
 
       if is_suspicious
@@ -577,9 +588,7 @@ def process_colo(
         start_city: colo_city_full,
         approx_final_hop: approx_final_hop,
         approx_nearest_gcp: approx_nearest_gcp,
-        target_distance_km: orthodromic_distance(
-          colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
-        ),
+        target_distance_km: target_distance_km,
         approx_gcp_city: approx_gcp_city,
         cross_country: is_cross_country,
         target_ip: target[:ip],
@@ -652,17 +661,23 @@ unless options[:postprocess_only]
 
   summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
   append_to_csv(
-    File.join(options[:output_dir], summary_filename), csv_data
+    File.join(options[:output_dir], summary_filename),
+    csv_data,
+    keep_sorted: options[:keep_sorted]
   ) unless csv_data.empty?
 
   skipped_colos_filename = options[:verbose] ? 'skipped_colos_verbose.csv' : 'skipped_colos.csv'
   append_to_csv(
-    File.join(options[:output_dir], skipped_colos_filename), skipped_data
+    File.join(options[:output_dir], skipped_colos_filename),
+    skipped_data,
+    keep_sorted: options[:keep_sorted]
   ) unless skipped_data.empty?
 
   suspicious_colos_filename = options[:verbose] ? 'suspicious_colos_verbose.csv' : 'suspicious_colos.csv'
   append_to_csv(
-    File.join(options[:output_dir], suspicious_colos_filename), suspicious_data
+    File.join(options[:output_dir], suspicious_colos_filename),
+    suspicious_data,
+    keep_sorted: options[:keep_sorted]
   ) unless suspicious_data.empty?
 end
 
