@@ -245,6 +245,7 @@ def analyze_last_valid_hop(hops, target_ip)
           min_rtt_ms: (node['min_rtt_ms'] || 0).to_f.round(2),
           max_rtt_ms: (node['max_rtt_ms'] || 0).to_f.round(2),
           std_dev_rtt_ms: (node['std_dev_rtt_ms'] || 0).to_f.round(2),
+          ip: node['ip'],
           packet_count: node['packet_count']
         }
       end
@@ -279,6 +280,7 @@ def analyze_last_valid_hop(hops, target_ip)
     min_rtt_ms: nil,
     max_rtt_ms: nil,
     std_dev_rtt_ms: nil,
+    ip: nil,
     packet_count: nil
   }
 
@@ -392,7 +394,7 @@ def log_skipped_traceroute(
 end
 
 def process_colo(
-  colo:, cf_colos:, options:, csv_data:, skipped_data:
+  colo:, cf_colos:, options:, csv_data:, skipped_data:, suspicious_data:
 )
   colo_info = cf_colos[colo.upcase]
   colo_name = colo.downcase
@@ -483,6 +485,16 @@ def process_colo(
       colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
 
       summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
+
+      # Determine if result is suspicious
+      colo_country = colo_country_short || colo_info['cca2'] || colo_info['country']
+      is_cross_country = final_geo[:country] != 'unknown' &&
+                        colo_country != 'unknown' &&
+                        final_geo[:country] != colo_country
+      is_suspicious = is_cross_country &&
+                     summary_stats[:rtt_ms] &&
+                     summary_stats[:rtt_ms] < 5
+
       approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
         final_geo[:lat], final_geo[:long]
       ) : 'not_applicable'
@@ -495,7 +507,7 @@ def process_colo(
         final_geo[:city].nil? || final_geo[:city].gsub(/[\s,]+/, '').empty? ? 'unknown' : final_geo[:city]
       )
 
-      csv_data << {
+      row_data = {
         start_region: region_short,
         start_colo: colo_name,
         start_subcolo: subcolo,
@@ -509,8 +521,11 @@ def process_colo(
           colo_info['lat'], colo_info['lon'], final_geo[:lat], final_geo[:long]
         ),
         approx_gcp_city: approx_gcp_city,
+        cross_country: is_cross_country,
         target_ip: target[:ip],
         target_domain: target[:domain],
+        stats_ip: summary_stats[:ip],
+        final_geo_ip: final_geo[:ip],
         traceroute_time_ms: traceroute_time_ms,
         traceroute_packet_count: summary_stats[:packet_count] || 'unknown',
         min_rtt_ms: summary_stats[:min_rtt_ms] || 0,
@@ -526,6 +541,12 @@ def process_colo(
         slowest_hops: slowest_hops.to_json,
         traceroute_uri: uri
       }
+
+      if is_suspicious
+        suspicious_data << row_data
+      else
+        csv_data << row_data
+      end
     end
   end
 rescue StandardError => e
@@ -555,6 +576,7 @@ unless options[:postprocess_only]
 
   csv_data = []
   skipped_data = []
+  suspicious_data = []
 
   options[:colos].each do |colo|
     sleep 2
@@ -563,7 +585,8 @@ unless options[:postprocess_only]
       cf_colos: cf_colos,
       options: options,
       csv_data: csv_data,
-      skipped_data: skipped_data
+      skipped_data: skipped_data,
+      suspicious_data: suspicious_data
     )
   end
 
@@ -576,6 +599,11 @@ unless options[:postprocess_only]
   append_to_csv(
     File.join(options[:output_dir], skipped_colos_filename), skipped_data
   ) unless skipped_data.empty?
+
+  suspicious_colos_filename = options[:verbose] ? 'suspicious_colos_verbose.csv' : 'suspicious_colos.csv'
+  append_to_csv(
+    File.join(options[:output_dir], suspicious_colos_filename), suspicious_data
+  ) unless suspicious_data.empty?
 end
 
 def generate_rtt_matrix(summary_file, output_dir, colo_key: 'start_colo', region: nil)
