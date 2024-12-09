@@ -6,6 +6,7 @@ require 'net/http'
 require 'optparse'
 require 'fileutils'
 require 'set'
+require 'logger'
 
 DEFAULT_TRACEROUTE_URI = 'https://findit.martelogan.workers.dev/trace'
 DEFAULT_OUTPUT_DIR = 'results'
@@ -803,6 +804,42 @@ def generate_stat_row(data, region_name)
 
   ordered_row
 end
+
+# Persist any logs that we printed to console
+FileUtils.mkdir_p('logs')
+$stdout_logger = Logger.new(
+  File.join('logs', 'collector.log'),
+  'daily'
+)
+$stderr_logger = Logger.new(
+  File.join('logs', 'collector.err.log'),
+  'daily'
+)
+
+# Redirect stdout and stderr
+$stdout.sync = true
+$stderr.sync = true
+
+class MultiIO
+  def initialize(*targets)
+    @targets = targets
+  end
+
+  def write(*args)
+    @targets.each { |t| t.write(*args) }
+  end
+
+  def close
+    @targets.each(&:close)
+  end
+
+  def flush
+    @targets.each(&:flush)
+  end
+end
+
+$stdout = MultiIO.new($stdout, $stdout_logger.instance_variable_get(:@logdev).dev)
+$stderr = MultiIO.new($stderr, $stderr_logger.instance_variable_get(:@logdev).dev)
 
 summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
 summary_file = File.join(options[:output_dir], summary_filename)
