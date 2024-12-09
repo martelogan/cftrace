@@ -94,7 +94,8 @@ options = {
   verbose: true,
   generate_matrix: true,
   generate_aggregates: true,
-  postprocess_only: true
+  postprocess_only: true,
+  keep_sorted: true
 }
 
 OptionParser.new do |opts|
@@ -284,6 +285,8 @@ def analyze_last_valid_hop(hops, target_ip)
     packet_count: nil
   }
 
+  puts "Results indicate path to target via #{geo_info[:city]} in #{summary_stats[:rtt_ms]}ms"
+
   [summary_stats, geo_info]
 end
 
@@ -364,12 +367,53 @@ def collect_hop_data(hops)
   [congested_hops, slowest_hops]
 end
 
+def sort_csv_file(file_path)
+  return unless File.exist?(file_path)
+
+  # Read existing CSV data
+  rows = []
+  headers = nil
+  CSV.foreach(file_path, headers: true) do |row|
+    headers ||= row.headers
+    rows << row.to_h
+  end
+
+  return if rows.empty?
+
+  # Sort rows by region precedence
+  sorted_rows = rows.sort_by do |row|
+    [
+      REGION_PRECEDENCE.index(row['start_region']) || REGION_PRECEDENCE.size,
+      row
+    ]
+  end
+
+  # Write back sorted data
+  CSV.open(file_path, 'w') do |csv|
+    csv << headers
+    sorted_rows.each { |row| csv << row.values }
+  end
+end
+
 def append_to_csv(file, data)
+  return if data.empty?
+
+  # Sort new data by region precedence
+  sorted_data = data.sort_by do |row|
+    [
+      REGION_PRECEDENCE.index(row[:start_region] || row['start_region']) || REGION_PRECEDENCE.size,
+      row
+    ]
+  end
+
   write_headers = !File.exist?(file)
   CSV.open(file, 'a') do |csv|
-    csv << data.first.keys if write_headers && data.any?
-    data.each { |row| csv << row.values }
+    csv << sorted_data.first.keys if write_headers
+    sorted_data.each { |row| csv << row.values }
   end
+
+  # Sort entire file if keep_sorted is enabled
+  sort_csv_file(file) if options[:keep_sorted]
 end
 
 def log_skipped_traceroute(
@@ -390,7 +434,7 @@ def log_skipped_traceroute(
     skipped_reason: skip_reason,
     error_details: error_details
   }
-  sleep 2
+  sleep 10
 end
 
 def process_colo(
@@ -484,6 +528,7 @@ def process_colo(
       colo_city_parts = colo_city_full.split(',')
       colo_country_short = colo_city_parts.last.strip if colo_city_parts.size > 1
 
+      puts "Reverse-analyzing #{hops.size} hops from #{colo_city_full} to #{target[:ip]}..."
       summary_stats, final_geo = analyze_last_valid_hop(hops, target[:ip])
 
       # Determine if result is suspicious
@@ -494,6 +539,19 @@ def process_colo(
       is_suspicious = is_cross_country &&
                      summary_stats[:rtt_ms] &&
                      summary_stats[:rtt_ms] < 5
+
+      if is_suspicious
+        puts "Suspicious traceroute encountered & tracked: " \
+             "region_short=#{region_short} " \
+             "subcolo=#{subcolo} " \
+             "colo_country=#{colo_country} " \
+             "final_geo_country=#{final_geo[:country]} " \
+             "rtt_ms=#{summary_stats[:rtt_ms]}ms " \
+             "target_ip=#{target[:ip]} " \
+             "summary_stats_ip=#{summary_stats[:ip]} " \
+             "final_geo_ip=#{final_geo[:ip]} " \
+             "traceroute_uri=#{uri}"
+      end
 
       approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
         final_geo[:lat], final_geo[:long]
@@ -579,7 +637,7 @@ unless options[:postprocess_only]
   suspicious_data = []
 
   options[:colos].each do |colo|
-    sleep 2
+    sleep 3
     process_colo(
       colo: colo,
       cf_colos: cf_colos,
@@ -922,3 +980,12 @@ if options[:verbose] && options[:generate_matrix]
 end
 
 puts "Data collection complete. Results saved in #{options[:output_dir]}"
+
+# At the end of the script, ensure relevant CSVs are sorted
+if options[:keep_sorted]
+  Dir.glob(File.join(options[:output_dir], '*.csv')).each do |csv_file|
+    # Skip matrix files which have a specific structure
+    next if csv_file.include?('rtt_matrix')
+    sort_csv_file(csv_file)
+  end
+end
