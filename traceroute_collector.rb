@@ -83,6 +83,43 @@ GCP_REGION_PRECEDENCE = [
   /^africa-/        # Then Africa
 ]
 
+# Persist any logs that we printed to console
+FileUtils.mkdir_p('logs')
+$stdout_logger = Logger.new(
+  File.join('logs', 'collector.log'),
+  'daily'
+)
+$stderr_logger = Logger.new(
+  File.join('logs', 'collector.err.log'),
+  'daily'
+)
+
+# Redirect stdout and stderr
+$stdout.sync = true
+$stderr.sync = true
+
+class MultiIO
+  def initialize(*targets)
+    @targets = targets
+  end
+
+  def write(*args)
+    @targets.each { |t| t.write(*args) }
+  end
+
+  def close
+    @targets.each(&:close)
+  end
+
+  def flush
+    @targets.each(&:flush)
+  end
+end
+
+$stdout = MultiIO.new($stdout, $stdout_logger.instance_variable_get(:@logdev).dev)
+$stderr = MultiIO.new($stderr, $stderr_logger.instance_variable_get(:@logdev).dev)
+
+
 options = {
   traceroute_uri: DEFAULT_TRACEROUTE_URI,
   output_dir: DEFAULT_OUTPUT_DIR,
@@ -253,10 +290,10 @@ def analyze_last_valid_hop(hops, target_ip)
       # (including target_ip if it has valid summary_stats)
       if summary_stats.nil? && node['mean_rtt_ms'] != 0
         summary_stats = {
-          rtt_ms: (node['mean_rtt_ms'] || 0).to_i,
-          min_rtt_ms: (node['min_rtt_ms'] || 0).to_f.round(2),
-          max_rtt_ms: (node['max_rtt_ms'] || 0).to_f.round(2),
-          std_dev_rtt_ms: (node['std_dev_rtt_ms'] || 0).to_f.round(2),
+          rtt_ms: [(node['mean_rtt_ms'] || 0).to_f, 0].max.to_i,
+          min_rtt_ms: [(node['min_rtt_ms'] || 0).to_f, 0].max.round(2),
+          max_rtt_ms: [(node['max_rtt_ms'] || 0).to_f, 0].max.round(2),
+          std_dev_rtt_ms: [(node['std_dev_rtt_ms'] || 0).to_f, 0].max.round(2),
           ip: node['ip'],
           packet_count: node['packet_count']
         }
@@ -600,11 +637,21 @@ def process_successful_traceroute(
     is_cross_country = final_geo[:country] != 'unknown' &&
                       colo_country != 'unknown' &&
                       final_geo[:country] != colo_country
-    is_suspicious = is_cross_country &&
+
+    is_fast_cross_country = is_cross_country &&
                    summary_stats[:rtt_ms] &&
                    target_distance_km != 'unknown' &&
                    target_distance_km > 1000 &&
                    summary_stats[:rtt_ms] < 5
+
+    is_too_large_distance = target_distance_km != 'unknown' &&
+                            target_distance_km > 5000
+
+    is_negative_rtt = summary_stats[:rtt_ms] && summary_stats[:rtt_ms] < 0
+
+    is_suspicious = is_fast_cross_country ||
+                    is_too_large_distance ||
+                    is_negative_rtt
 
     if is_suspicious
       puts "Suspicious traceroute encountered & tracked: " \
@@ -1031,42 +1078,6 @@ def generate_stat_row(data, region_name)
 
   ordered_row
 end
-
-# Persist any logs that we printed to console
-FileUtils.mkdir_p('logs')
-$stdout_logger = Logger.new(
-  File.join('logs', 'collector.log'),
-  'daily'
-)
-$stderr_logger = Logger.new(
-  File.join('logs', 'collector.err.log'),
-  'daily'
-)
-
-# Redirect stdout and stderr
-$stdout.sync = true
-$stderr.sync = true
-
-class MultiIO
-  def initialize(*targets)
-    @targets = targets
-  end
-
-  def write(*args)
-    @targets.each { |t| t.write(*args) }
-  end
-
-  def close
-    @targets.each(&:close)
-  end
-
-  def flush
-    @targets.each(&:flush)
-  end
-end
-
-$stdout = MultiIO.new($stdout, $stdout_logger.instance_variable_get(:@logdev).dev)
-$stderr = MultiIO.new($stderr, $stderr_logger.instance_variable_get(:@logdev).dev)
 
 summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
 summary_file = File.join(options[:output_dir], summary_filename)
