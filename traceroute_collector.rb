@@ -135,6 +135,7 @@ options = {
   keep_sorted: true,
   use_local_json: true,
   retry_count: 1,
+  delete_suspicious: true,
 }
 
 OptionParser.new do |opts|
@@ -191,6 +192,9 @@ OptionParser.new do |opts|
   end
   opts.on("--retry-count COUNT", "Number of retries for traceroute data") do |count|
     options[:retry_count] = count.to_i
+  end
+  opts.on("--delete-suspicious", "Delete suspicious routes from existing summary before appending") do
+    options[:delete_suspicious] = true
   end
 end.parse!
 
@@ -466,6 +470,80 @@ def append_to_csv(file, data, keep_sorted: true)
 
   # Sort entire file if keep_sorted is enabled
   sort_csv_file(file) if keep_sorted
+end
+
+def remove_suspicious_routes(file_path)
+  return unless File.exist?(file_path)
+
+  temp_file = "#{file_path}.tmp"
+  headers = nil
+  rows_kept = 0
+  rows_removed = 0
+
+  CSV.open(temp_file, 'w') do |csv_out|
+    CSV.foreach(file_path, headers: true) do |row|
+      headers ||= row.headers
+      csv_out << headers if headers && csv_out.lineno == 0
+
+      suspicious_details = []
+      is_suspicious = is_suspicious_route?(
+        rtt_ms: row['rtt_ms'],
+        target_distance_km: row['target_distance_km'],
+        is_cross_country: row['cross_country'] == 'true',
+        details: suspicious_details
+      )
+
+      if is_suspicious
+        rows_removed += 1
+        puts "Removing suspicious route: #{row['start_colo']} -> #{row['trace_target']} " \
+             "(RTT: #{row['rtt_ms']}ms, Distance: #{row['target_distance_km']}km, " \
+             "Cross-country: #{row['cross_country']}) - Reason: #{suspicious_details.first}"
+      else
+        csv_out << row
+        rows_kept += 1
+      end
+    end
+  end
+
+  if rows_removed > 0
+    FileUtils.mv(temp_file, file_path)
+    puts "Removed #{rows_removed} suspicious routes from #{file_path} (kept #{rows_kept} routes)"
+  else
+    FileUtils.rm(temp_file)
+    puts "No suspicious routes found in #{file_path}"
+  end
+end
+
+def is_suspicious_route?(
+  rtt_ms:,
+  target_distance_km:,
+  is_cross_country:,
+  details: []
+)
+  return false if rtt_ms.nil? || target_distance_km.nil?
+
+  rtt = rtt_ms.to_f
+  distance = target_distance_km.to_f
+
+  is_fast_cross_country = is_cross_country &&
+                         distance > 1000 &&
+                         rtt < 5
+  is_too_large_distance = distance > 5000
+  is_negative_rtt = rtt < 0
+
+  is_suspicious = is_fast_cross_country ||
+                 is_too_large_distance ||
+                 is_negative_rtt
+
+  if is_suspicious && details
+    details << [
+      (is_fast_cross_country ? "fast_cross_country" : nil),
+      (is_too_large_distance ? "large_distance" : nil),
+      (is_negative_rtt ? "negative_rtt" : nil)
+    ].compact.join(", ")
+  end
+
+  is_suspicious
 end
 
 def log_skipped_traceroute(
@@ -794,6 +872,12 @@ rescue StandardError => e
       error_details: error_msg
     )
   end
+end
+
+if options[:delete_suspicious]
+  summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
+  summary_file = File.join(options[:output_dir], summary_filename)
+  remove_suspicious_routes(summary_file) if File.exist?(summary_file)
 end
 
 # Main execution block
