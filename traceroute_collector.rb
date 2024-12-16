@@ -531,7 +531,28 @@ def process_traceroute_with_retry(
       error_details = traceroute['error'] || 'not_applicable'
     end
 
-    if skip_reason && retries_remaining > 0
+    if skip_reason.nil?
+      invalid_results_reason = catch(:retry_needed) do
+        process_successful_traceroute(
+          colo_info: colo_info,
+          uri: uri,
+          traceroute: traceroute,
+          region_dir: region_dir,
+          region_short: region_short,
+          colo_name: colo_name,
+          target: target,
+          options: options,
+          csv_data: csv_data,
+          skipped_data: skipped_data,
+          suspicious_data: suspicious_data
+        )
+        return # Successfully processed
+      end
+      skip_reason = invalid_results_reason[:skip_reason]
+      error_details = invalid_results_reason[:error_details]
+    end
+
+    if retries_remaining > 0
       retries_remaining -= 1
       puts "Retrying due to #{skip_reason}. #{retries_remaining} retries remaining..."
       sleep(5 * (options[:retry_count] - retries_remaining))
@@ -539,30 +560,13 @@ def process_traceroute_with_retry(
     end
 
     # Log skip if we've exhausted retries
-    if skip_reason
-      log_skipped_traceroute(
-        skipped_data: skipped_data,
-        region_short: region_short,
-        colo_name: colo_name,
-        target: target,
-        skip_reason: skip_reason,
-        error_details: error_details
-      )
-      return
-    end
-
-    process_successful_traceroute(
-      colo_info: colo_info,
-      uri: uri,
-      traceroute: traceroute,
-      region_dir: region_dir,
+    log_skipped_traceroute(
+      skipped_data: skipped_data,
       region_short: region_short,
       colo_name: colo_name,
       target: target,
-      options: options,
-      csv_data: csv_data,
-      skipped_data: skipped_data,
-      suspicious_data: suspicious_data
+      skip_reason: skip_reason,
+      error_details: error_details
     )
     return
   end
@@ -580,6 +584,9 @@ def process_successful_traceroute(
 
   # TODO: support multiple traceroutes option for same subcolo
   repeated_subcolos = Set.new
+  suspicious_routes_found = false
+  suspicious_details = []
+
   colos_to_process.each do |colos_data|
     next unless colos_data
 
@@ -680,6 +687,18 @@ def process_successful_traceroute(
       end
 
       puts "Moved suspicious traceroute JSON files to #{suspicious_dir}"
+      suspicious_details << {
+        subcolo: subcolo,
+        reason: [
+          (is_fast_cross_country ? "fast_cross_country" : nil),
+          (is_too_large_distance ? "large_distance" : nil),
+          (is_negative_rtt ? "negative_rtt" : nil)
+        ].compact.join(", ")
+      }
+      throw :retry_needed, {
+        skip_reason: 'suspicious_route',
+        error_details: suspicious_details.map { |d| "#{d[:subcolo]}: #{d[:reason]}" }.join("; ")
+      }
     end
 
     approx_nearest_gcp = options[:target_is_gcp] ? map_gcp_region(
