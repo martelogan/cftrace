@@ -3,6 +3,9 @@
 results/*
 cached/*
 
+presentable/*
+suspicious/*
+
 *.bak*
 
 !curl-format.txt
