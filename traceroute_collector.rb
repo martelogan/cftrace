@@ -877,9 +877,17 @@ end
 if options[:delete_suspicious]
   summary_filename = options[:verbose] ? 'traceroute_summary_verbose.csv' : 'traceroute_summary.csv'
   summary_file = File.join(options[:output_dir], summary_filename)
-  remove_suspicious_routes(summary_file) if File.exist?(summary_file)
+  if File.exist?(summary_file)
+    puts "\n[Analysis preprocessing]: removing legacy suspicious routes from existing #{summary_file} data..."
+    sleep 1
+    remove_suspicious_routes(summary_file)
+  end
 end
 
+sleep 1
+puts "\nStarting data collection execution: current_time=#{Time.now.strftime('%Y-%m-%d %H:%M:%S')} " \
+      "summary_file=#{summary_file} cf_colo_file=#{options[:cf_colo_file]} targets=#{options[:targets]}\n"
+sleep 1
 # Main execution block
 unless options[:postprocess_only]
   Dir.mkdir(options[:output_dir]) unless Dir.exist?(options[:output_dir])
